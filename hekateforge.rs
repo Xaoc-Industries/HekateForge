@@ -1,12 +1,16 @@
-use rand::{rngs::StdRng, Rng, SeedableRng};
+use rand::rngs::{OsRng, StdRng};
+use rand::TryRngCore;
+use rand::Rng;
 use std::{env, fs::{File}, io::{Read, Write, stdin, stdout}};
 use base64::{encode, decode, DecodeError};
 use std::collections::HashMap;
 use sha2::{Sha256, Digest};
 use std::time::{SystemTime, UNIX_EPOCH};
 use serde::{Serialize, Deserialize};
-use rand::seq::SliceRandom;
 use rayon::prelude::*;
+use rand_chacha::ChaCha8Rng;
+use rand::SeedableRng;
+use rand::prelude::IndexedRandom;
 
 #[derive(Serialize, Deserialize)]
 struct PoolKeyJson {
@@ -87,13 +91,20 @@ pub fn digester(entropy_pool_bytes: &[u8]) -> HashMap<u8, Vec<usize>> {
 }
 
 pub fn reference_mapper(pool_index_list: &HashMap<u8, Vec<usize>>, raw_bytes: &[u8]) -> Result<Vec<u8>, String> {
-    let mut rng = rand::rngs::OsRng;
+    // Get a reasonably large random seed from OsRng
+    let mut seed = [0u8; 32]; // 32 bytes for a reasonably large seed
+    OsRng.try_fill_bytes(&mut seed); // Fill the seed with random data
+
+    // Seed ChaCha8Rng with the generated random seed
+    let mut chacha_rng = ChaCha8Rng::from_seed(seed);
+
     let mut host_payload_index_map: Vec<usize> = Vec::with_capacity(raw_bytes.len());
 
     for &byt in raw_bytes {
         match pool_index_list.get(&byt) {
             Some(indexes) if !indexes.is_empty() => {
-                let choice = indexes.choose(&mut rng).expect("non-empty slice");
+                // Use the ChaCha PRNG to choose a random index.
+                let choice = indexes.choose(&mut chacha_rng).expect("non-empty slice");
                 host_payload_index_map.push(*choice);
             }
             Some(_) => {
@@ -174,6 +185,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             return Ok(());
         }
     };
+    if pool_key.len() != 4096 {
+        eprintln!("Error: Key should be 4096 bytes.");
+        return Ok(());
+    }
     let mut input_stream = stdin();
     let mut raw_bytes = Vec::new();
     input_stream.read_to_end(&mut raw_bytes)?;
