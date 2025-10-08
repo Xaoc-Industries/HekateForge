@@ -7,7 +7,9 @@
 
 **USAGE**
 
-*dd if=/path/to/file | hekateforge encode $key > /path/to/output*
+*dd if=/path/to/file | hekateforge encode $key > /path/to/output.pld*
+
+*dd if=/path/to/pld | hekateforge decode $key > /path/to/recovered/file*
 
 $key should be a base64 representation of 4KB of random data (4096 Bytes)
 
