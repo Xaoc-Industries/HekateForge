@@ -18,3 +18,6 @@ I find that:
 *key=$(dd if=\dev\zero bs=1 count=4096 | base64 -w 0)*
 
 works well for key generation.
+
+***HekateForge is patent pending as of June 27 2025***
+**All rights reserved**
