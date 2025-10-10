@@ -11,11 +11,11 @@
 
 *dd if=/path/to/pld | hekateforge decode $key > /path/to/recovered/file*
 
-$key should be a base64 representation of 4KB of random data (4096 Bytes)
+$key should be a base64 representation of 512 bits (64 Bytes) of random data
 
 I find that:
 
-*key=$(dd if=\dev\zero bs=1 count=4096 | base64 -w 0)*
+*key=$(dd if=\dev\random bs=1 count=64 | base64 -w 0)*
 
 works well for key generation.
 
