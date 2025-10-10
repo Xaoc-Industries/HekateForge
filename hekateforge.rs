@@ -1,18 +1,23 @@
-use rand::rngs::{OsRng, StdRng};
 use rand::TryRngCore;
-use rand::Rng;
 use std::{env, fs::{File}, io::{Read, Write, stdin, stdout}};
 use base64::{encode, decode, DecodeError};
 use std::collections::HashMap;
-use sha2::{Sha256, Digest};
-use std::time::{SystemTime, UNIX_EPOCH};
 use serde::{Serialize, Deserialize};
 use rayon::prelude::*;
 use rand_chacha::ChaCha8Rng;
-use rand::SeedableRng;
 use rand::prelude::IndexedRandom;
+use rand::{Rng, SeedableRng};
+use rand::rngs::{OsRng, StdRng};
+use std::time::{SystemTime, UNIX_EPOCH};
+use sha2::{Sha256, Digest};
 
-#[derive(Serialize, Deserialize)]
+#[derive(Debug)]
+enum Mode {
+    Encode,
+    Decode,
+}
+
+#[derive(Serialize)]
 struct PoolKeyJson {
     TTL: u64,
     GeneratedAt: u64,
@@ -21,13 +26,11 @@ struct PoolKeyJson {
     PoolKey: String,
 }
 
-#[derive(Debug)]
-enum Mode {
-    Encode,
-    Decode,
+fn xor_reduce(data: &[u8]) -> u8 {
+    data.iter().fold(0u8, |acc, &byte| acc ^ byte)
 }
 
-fn expand_key_16_to_32(key: &[u8; 16]) -> [u8; 32] {
+fn expand_key_8_to_32(key: &[u8; 8]) -> [u8; 32] {
     let mut hasher = Sha256::new();
     hasher.update(key);
     let result = hasher.finalize();
@@ -36,10 +39,37 @@ fn expand_key_16_to_32(key: &[u8; 16]) -> [u8; 32] {
     expanded_key
 }
 
-pub fn pool_generator(timeout: u64, pool_key: &[u8]) -> (String, Vec<u8>) {
+fn expand_key_64_to_2048(input_key: &[u8; 64]) -> [u8; 2048] {
+    let mut expanded = [0u8; 2048];
+    let mut offset = 0;
+    for i in 0..64 {
+        let mut hasher = Sha256::new();
+        hasher.update(input_key);
+        hasher.update(&(i as u32).to_be_bytes());
+        let digest = hasher.finalize();
+        expanded[offset..offset + 32].copy_from_slice(&digest);
+        offset += 32;
+    }
+    expanded
+}
+
+fn expand_key_16_to_32(input: &[u8; 8]) -> [u8; 32] {
+    let mut expanded = [0u8; 32];
+    for i in 0..4 {
+        expanded[i * 8..(i + 1) * 8].copy_from_slice(input);
+    }
+    expanded
+}
+
+pub fn pool_generator(timeout: u64, mut pool_key: Vec<u8>, magic_number: &u8) -> (String, Vec<u8>) {
     let mut all_bytes: Vec<u8> = (0..=255).collect();
     let mut poolbytedata = Vec::new();
-    for chunk in pool_key.chunks(16) {
+
+    for (i, byte) in pool_key.iter_mut().enumerate() {
+        *byte ^= magic_number;
+    }
+
+    for chunk in pool_key.chunks(8) {
         if let Ok(seed_slice) = chunk.try_into() {
             let expanded_key = expand_key_16_to_32(seed_slice);
             let mut seed_rng = StdRng::from_seed(expanded_key);
@@ -50,9 +80,10 @@ pub fn pool_generator(timeout: u64, pool_key: &[u8]) -> (String, Vec<u8>) {
             }
             poolbytedata.extend(this_byte_shuffle);
         } else {
-            eprintln!("Warning: Skipping a chunk that isn't exactly 16 bytes.");
+            eprintln!("Warning: Skipping a chunk that isn't exactly 8 bytes.");
         }
     }
+
     let pool_data_b64 = encode(&poolbytedata);
     let mut hasher = Sha256::new();
     hasher.update(pool_data_b64.as_bytes());
@@ -64,7 +95,7 @@ pub fn pool_generator(timeout: u64, pool_key: &[u8]) -> (String, Vec<u8>) {
     let pool_key_json = PoolKeyJson {
         TTL: expiry_at,
         GeneratedAt: generated_at,
-        EnSrc: "V3.0".to_string(),
+        EnSrc: "V3.5".to_string(),
         SHA256: pool_hash_hex,
         PoolKey: encode(pool_key),
     };
@@ -72,6 +103,7 @@ pub fn pool_generator(timeout: u64, pool_key: &[u8]) -> (String, Vec<u8>) {
     let pool_json_str = serde_json::to_string(&pool_key_json).unwrap();
     (pool_json_str, poolbytedata)
 }
+
 
 pub fn digester(entropy_pool_bytes: &[u8]) -> HashMap<u8, Vec<usize>> {
     let mut pool_index_list: HashMap<u8, Vec<usize>> = HashMap::with_capacity(256);
@@ -91,11 +123,10 @@ pub fn digester(entropy_pool_bytes: &[u8]) -> HashMap<u8, Vec<usize>> {
 }
 
 pub fn reference_mapper(pool_index_list: &HashMap<u8, Vec<usize>>, raw_bytes: &[u8]) -> Result<Vec<u8>, String> {
-    // Get a reasonably large random seed from OsRng
-    let mut seed = [0u8; 32]; // 32 bytes for a reasonably large seed
-    OsRng.try_fill_bytes(&mut seed); // Fill the seed with random data
 
-    // Seed ChaCha8Rng with the generated random seed
+    let mut seed = [0u8; 32];
+    OsRng.try_fill_bytes(&mut seed);
+
     let mut chacha_rng = ChaCha8Rng::from_seed(seed);
 
     let mut host_payload_index_map: Vec<usize> = Vec::with_capacity(raw_bytes.len());
@@ -103,7 +134,7 @@ pub fn reference_mapper(pool_index_list: &HashMap<u8, Vec<usize>>, raw_bytes: &[
     for &byt in raw_bytes {
         match pool_index_list.get(&byt) {
             Some(indexes) if !indexes.is_empty() => {
-                // Use the ChaCha PRNG to choose a random index.
+
                 let choice = indexes.choose(&mut chacha_rng).expect("non-empty slice");
                 host_payload_index_map.push(*choice);
             }
@@ -133,9 +164,6 @@ pub fn decoder(indices: &[usize], entropy_pool_bytes: &[u8]) -> Result<Vec<u8>, 
     let pool_len = entropy_pool_bytes.len();
 
     for &idx in indices {
-        if idx >= pool_len {
-            return Err(format!("Index {} out of range (entropy pool length {})", idx, pool_len));
-        }
         payload.push(entropy_pool_bytes[idx]);
     }
 
@@ -163,12 +191,14 @@ fn decode_base64(encoded: &str) -> Result<Vec<u8>, DecodeError> {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    use std::io::BufReader;
+
     let args: Vec<String> = env::args().collect();
     if args.len() < 3 {
-        eprintln!("Usage: <program> <mode> <base64_pool_key>");
-        eprintln!("Modes: encode | decode");
+        eprintln!("Usage: <program> <encode|decode> <base64_pool_key>");
         return Ok(());
     }
+
     let mode = match args[1].as_str() {
         "encode" => Mode::Encode,
         "decode" => Mode::Decode,
@@ -177,43 +207,76 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             return Ok(());
         }
     };
+
     let base64_pool_key = &args[2];
-    let pool_key = match decode_base64(base64_pool_key) {
-        Ok(decoded_key) => decoded_key,
+    let decoded_key = match decode_base64(base64_pool_key) {
+        Ok(decoded) => decoded,
         Err(e) => {
             eprintln!("Failed to decode base64 pool_key: {}", e);
             return Ok(());
         }
     };
-    if pool_key.len() != 4096 {
-        eprintln!("Error: Key should be 4096 bytes.");
+
+    if decoded_key.len() != 64 {
+        eprintln!("Error: pool_key should be 512 bits.");
         return Ok(());
     }
-    let mut input_stream = stdin();
-    let mut raw_bytes = Vec::new();
-    input_stream.read_to_end(&mut raw_bytes)?;
-    let chunk_size = raw_bytes.len() / 8;
-    let chunks: Vec<&[u8]> = (0..8).map(|i| {
-        let start = i * chunk_size;
-        let end = if i == 7 { raw_bytes.len() } else { (i + 1) * chunk_size };
-        &raw_bytes[start..end]
-    }).collect();
-    let (pool_key_json, pool_bytes) = pool_generator(600, &pool_key);
+
+    let expanded_key_array = expand_key_64_to_2048(&decoded_key.try_into().unwrap());
+    let mut pool_key = expanded_key_array.to_vec();
+
+    let magic_number = xor_reduce(&pool_key);
+    let (pool_key_json, pool_bytes) = pool_generator(600, pool_key, &magic_number);
     let pool_index_list = digester(&pool_bytes);
+
+    let stdin = stdin();
+    let mut reader = BufReader::new(stdin.lock());
+    let mut buffer = [0u8; 512];
+
+    let stdout = stdout();
+    let mut handle = stdout.lock();
 
     match mode {
         Mode::Encode => {
-            let results: Vec<Vec<u8>> = chunks.into_par_iter().map(|chunk| {
-                reference_mapper(&pool_index_list, chunk).unwrap()
-            }).collect();
-            let combined_result: Vec<u8> = results.into_iter().flatten().collect();
-            stdout().write_all(&combined_result)?;
+            loop {
+                let n = reader.read(&mut buffer)?;
+                if n == 0 {
+                    break;
+                }
+
+                let chunk = &buffer[..n];
+                let encoded_chunk = reference_mapper(&pool_index_list, chunk)?;
+
+                handle.write_all(&encoded_chunk)?;
+            }
         }
         Mode::Decode => {
-            let unpacked_indices = unpack_pld_to_indices(&raw_bytes)?;
-            let decoded_data = decoder(&unpacked_indices, &pool_bytes)?;
-            stdout().write_all(&decoded_data)?;
+            let mut decode_buf = Vec::new();
+            loop {
+                let n = reader.read(&mut buffer)?;
+                if n == 0 {
+                    break;
+                }
+
+                decode_buf.extend_from_slice(&buffer[..n]);
+
+                while decode_buf.len() >= 2 {
+                    let chunk_len = (decode_buf.len() / 2) * 2;
+                    let (process_chunk, remaining) = decode_buf.split_at(chunk_len);
+
+                    let indices = unpack_pld_to_indices(process_chunk)?;
+                    let decoded_data = decoder(&indices, &pool_bytes)?;
+
+                    handle.write_all(&decoded_data)?;
+                    decode_buf = remaining.to_vec();
+                }
+            }
+
+            if !decode_buf.is_empty() {
+                return Err("Decode error: leftover bytes that do not make a full 2-byte pair".into());
+            }
         }
     }
+
     Ok(())
 }
